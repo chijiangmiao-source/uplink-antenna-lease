@@ -117,6 +117,65 @@ class ProgressResponse(BaseModel):
         return value.isoformat()
 
 
+class BundleAcquireRequest(BaseModel):
+    """Dual-site coordinated uplink: two antennas granted atomically."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    # Exactly two DISTINCT provisioned antenna ids. Order is not significant:
+    # the service canonicalises the pair before locking and fingerprinting.
+    antenna_ids: list[str] = Field(..., min_length=2, max_length=2)
+    controller: str = Field(..., min_length=1, max_length=128)
+    duration_seconds: StrictInt = Field(
+        ...,
+        ge=MIN_LEASE_SECONDS,
+        le=MAX_LEASE_SECONDS,
+        description=f"租约时长（必须是 JSON 整数，不接受文本数字），闭区间 [{MIN_LEASE_SECONDS}, {MAX_LEASE_SECONDS}] 秒，对两份租约同时生效。",
+    )
+    idempotency_key: str = Field(..., min_length=1, max_length=128)
+
+    @field_validator("antenna_ids")
+    @classmethod
+    def _two_distinct_antennas(cls, value: list[str]) -> list[str]:
+        for item in value:
+            if not item or not item.strip():
+                raise ValueError("天线编号不能为空或纯空白。")
+            if len(item) > 64:
+                raise ValueError("天线编号最长 64 字符。")
+        if len(set(value)) != 2:
+            raise ValueError("双站协同上行需要两个不同的天线编号。")
+        return value
+
+    @field_validator("controller", "idempotency_key")
+    @classmethod
+    def _reject_blank(cls, value: str) -> str:
+        if not value or not value.strip():
+            raise ValueError("不能为空或纯空白。")
+        return value
+
+
+class BundleLeaseItem(BaseModel):
+    """One member lease of a granted bundle (a perfectly ordinary lease)."""
+
+    antenna_id: str
+    lease_token: str
+    control_generation: int
+
+
+class BundleAcquireResponse(BaseModel):
+    controller: str
+    # Sampled once from the database clock and shared by both member leases;
+    # serialised exactly like every other timestamp in the service.
+    acquired_at: datetime
+    expires_at: datetime
+    leases: list[BundleLeaseItem]
+    replay: bool = False
+
+    @field_serializer("acquired_at", "expires_at", when_used="always")
+    def _serialize_iso8601(self, value: datetime) -> str:
+        return value.isoformat()
+
+
 class RenewRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 

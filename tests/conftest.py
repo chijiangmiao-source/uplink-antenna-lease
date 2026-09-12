@@ -65,7 +65,8 @@ def reset_lease_tables(db_engine: Engine):
         conn.execute(
             text(
                 "TRUNCATE TABLE renewal_idempotency_keys, idempotency_keys, "
-                "lease_renewals, leases RESTART IDENTITY CASCADE"
+                "lease_renewals, lease_bundles, leases "
+                "RESTART IDENTITY CASCADE"
             )
         )
         # The antenna generation high-water marks live in the preserved
@@ -103,6 +104,25 @@ def acquire(
 
 def release(client: httpx.Client, lease_token: str) -> httpx.Response:
     return client.post(f"/leases/{lease_token}/release")
+
+
+def bundle(
+    client: httpx.Client,
+    *,
+    antenna_ids: list[str] | None = None,
+    controller: str = "dual-site-ctrl",
+    duration_seconds: int = 30,
+    idempotency_key: str | None = None,
+) -> httpx.Response:
+    return client.post(
+        "/lease-bundles",
+        json={
+            "antenna_ids": antenna_ids or ["ANT-01", "ANT-02"],
+            "controller": controller,
+            "duration_seconds": duration_seconds,
+            "idempotency_key": idempotency_key or make_key("bundle"),
+        },
+    )
 
 
 def renew(

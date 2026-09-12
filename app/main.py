@@ -12,7 +12,7 @@ from sqlalchemy import text
 
 from app.db import engine
 from app.errors import api_error_handler, validation_error_handler, APIError
-from app.routers import catalog, leases
+from app.routers import bundles, catalog, leases
 
 app = FastAPI(
     title="卫星天线控制租约服务",
@@ -26,6 +26,7 @@ app = FastAPI(
 app.add_exception_handler(APIError, api_error_handler)
 app.add_exception_handler(RequestValidationError, validation_error_handler)
 app.include_router(leases.router)
+app.include_router(bundles.router)
 app.include_router(catalog.router)
 
 

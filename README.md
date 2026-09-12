@@ -20,7 +20,12 @@
 - 过站期间控制程序连续下发多条指令，值班人员可凭令牌**上报已确认执行到的指令序号**
   （`POST /leases/{lease_token}/progress`）：序号只能递增，相同序号重放返回原记录时间，
   上报**不会延长租约占用期限**；
-- 未知天线、越界租期返回稳定错误，且**不落任何库记录**。
+- 未知天线、越界租期返回稳定错误，且**不落任何库记录**；
+- **双站协同上行**：控制程序可一次申请**两副不同的预置天线**
+  （`POST /lease-bundles`）。服务在同一事务内**按编号排序锁定两副天线行**、
+  **只取一次数据库时间**算出两份租约完全相同的取得与到期时刻，确认两副均空闲
+  才一并写入——要么两副都拿到，要么一副都不占（反序并发申请不会死锁）；
+  两份令牌都是普通租约，可经原 `GET /leases/{lease_token}` 查询。
 
 技术栈：Python 3.12 · FastAPI · SQLAlchemy 2 · PostgreSQL 16（`pgcrypto`）· Alembic · pytest。
 
@@ -37,7 +42,7 @@
 │   ├── errors.py           # 统一错误信封 {error:{code,message,details}}
 │   ├── schemas.py          # Pydantic 请求/响应模型
 │   ├── services.py         # 原子获取租约的核心事务逻辑
-│   └── routers/            # HTTP 路由（leases、catalog）
+│   └── routers/            # HTTP 路由（leases、lease-bundles、catalog）
 ├── alembic/                # 迁移脚本（初始迁移含 6 副预置天线种子数据）
 ├── tests/                  # 连接真实 PostgreSQL 的验收测试
 ├── Dockerfile              # 多阶段：api 镜像 / verify 镜像
@@ -91,7 +96,7 @@ docker compose run --build verify
 ```
 
 验收测试会通过独立的数据库连接截断 `leases` / `idempotency_keys` /
-`lease_renewals` / `renewal_idempotency_keys` 表以保证用例独立，
+`lease_renewals` / `renewal_idempotency_keys` / `lease_bundles` 表以保证用例独立，
 因此请在测试环境运行（预置天线目录不会被清除）。
 
 ---
@@ -142,6 +147,14 @@ alembic downgrade base    # 回滚全部迁移
   回填——同一天线以取得时间排序、同一时刻以租约记录编号决胜，得到稠密的
   1..N；天线高水位回填为该天线历史最大代次（从未出租过的天线仍为 `NULL`）。
   因此升级后历史令牌查询有稳定代次，且升级后的首次新取得恰好是历史最大值 + 1。
+- `alembic/versions/0005_lease_bundles.py`：双站协同上行。新增
+  `lease_bundles(id, idempotency_key UNIQUE, controller, duration_seconds,
+  acquired_at, expires_at, request_params, created_at)`——组合申请记录本身即
+  组合幂等记录（与获取/续期幂等键分表，三类操作各自独立去重），CHECK 保证
+  `expires_at > acquired_at` 且租期在 5–120 秒；`leases` 增加可空
+  `bundle_id FK → lease_bundles.id`，把组合申请与其两份成员租约关联起来
+  （单天线租约恒为 `NULL`，历史记录不受影响），并加 `ix_leases_bundle`
+  索引服务重放查询。
 
 ---
 
@@ -358,7 +371,83 @@ curl -sS -X POST http://localhost:8000/leases/$LEASE_TOKEN/renew \
   -d '{"extra_seconds": 20, "idempotency_key": "renew-2026-09-12-ANT01-7f3a"}'
 ```
 
-### 4.6 其他接口
+### 4.6 双站协同上行 `POST /lease-bundles`
+
+双站协同上行只有在**两副天线都可用**时才能开始。控制程序一次提交两副不同的
+预置天线，服务在**一个事务**里按编号排序锁定两副天线行、**只取一次数据库时间**
+算出两份租约完全相同的取得与到期时刻，确认两副均空闲后才一并写入租约与组合
+申请记录：要么两副都拿到，要么一副都不占。
+
+请求体：
+
+| 字段 | 类型 | 约束 |
+| --- | --- | --- |
+| `antenna_ids` | string[2] | 恰好两个**不同**的预置天线编号（顺序无关） |
+| `controller` | string | 控制者标识，1–128 字符 |
+| `duration_seconds` | int | 租期，闭区间 **[5, 120]** 秒，对两份租约同时生效 |
+| `idempotency_key` | string | 调用方生成的幂等键，1–128 字符（与获取/续期幂等键分表） |
+
+成功 `200`：
+
+```json
+{
+  "controller": "gs-dual-A",
+  "acquired_at": "2026-09-12T04:00:00.123456+00:00",
+  "expires_at": "2026-09-12T04:00:30.123456+00:00",
+  "leases": [
+    {"antenna_id": "ANT-01", "lease_token": "k3J9…", "control_generation": 3},
+    {"antenna_id": "ANT-02", "lease_token": "x7Qm…", "control_generation": 1}
+  ],
+  "replay": false
+}
+```
+
+- 两份令牌都是**普通租约**：`GET /leases/{lease_token}` 查询、进度上报、
+  提前释放、续期对成员令牌照常工作；两副天线的 `control_generation`
+  各自按本天线序列递增；
+- `acquired_at` / `expires_at` 由一次 `clock_timestamp()` 采样得出，两份成员
+  租约与组合申请记录中的四个时间戳**逐字节相同**（格式与全服务一致，显式
+  `+00:00`）；
+- **同一幂等键 + 相同参数**（天线对顺序无关）重试返回原令牌组、原时间和
+  `replay: true`，不会产出第二组租约；**改动参数**（天线对、控制者、租期）
+  返回 `409 IDEMPOTENCY_CONFLICT`；
+- 天线未知（`404 ANTENNA_NOT_FOUND`）、两编号重复或数量不对（
+  `422 VALIDATION_ERROR`）、任一正被占用（`409 ANTENNA_BUSY`）时**整笔请求
+  不落库**；占用反馈在 `details.blocked_antennas` 中列出**每副**阻塞天线的
+  编号、持有方令牌与到期交接时间：
+
+```json
+{
+  "error": {
+    "code": "ANTENNA_BUSY",
+    "message": "双站协同上行被拒绝：天线 ANT-01 正被未到期租约占用，未占用任何天线。",
+    "details": {
+      "blocked_antennas": [
+        {
+          "antenna_id": "ANT-01",
+          "held_by_lease": "原令牌…",
+          "expires_at": "2026-09-12T04:00:30.123456+00:00"
+        }
+      ]
+    }
+  }
+}
+```
+
+curl：
+
+```bash
+curl -sS -X POST http://localhost:8000/lease-bundles \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "antenna_ids": ["ANT-01", "ANT-02"],
+    "controller": "gs-dual-A",
+    "duration_seconds": 30,
+    "idempotency_key": "dual-pass-2026-09-12-7f3a"
+  }'
+```
+
+### 4.7 其他接口
 
 - `GET /leases/{lease_token}` — 查询租约与 `active` 状态（以数据库时间实时计算），
   含固化的 `control_generation`、上述两个可空进度字段和可空的 `released_at`；
@@ -423,6 +512,25 @@ curl -sS -X POST http://localhost:8000/leases/$LEASE_TOKEN/renew \
 所有争抢者收到指向新边界的 `ANTENNA_BUSY`；要么边界已过、续期收到
 `LEASE_EXPIRED` 且恰有一位争抢者建约。
 
+双站协同组合申请（`POST /lease-bundles`）沿用同一模型，只是把行锁扩展到两副
+天线：
+
+1. `pg_advisory_xact_lock(hashtext(:idempotency_key))`
+   —— 相同组合幂等键的事务串行化（组合幂等键存放在 `lease_bundles`
+   自身，与获取/续期幂等键分表）；
+2. 查 `lease_bundles`：参数一致（天线对顺序无关）→ 重放原令牌组与原时间；
+   不一致 → 稳定 `IDEMPOTENCY_CONFLICT`；
+3. **按编号升序**逐副 `SELECT ... FROM antennas ... FOR UPDATE`
+   —— 所有申请者（组合或单天线）都按同一全局顺序取锁，两组反序天线
+   并发申请因此在第一副天线上串行化，**不会死锁**；未知天线在任何写入
+   之前返回；
+4. 两副天线都以 `released_at IS NULL AND expires_at > clock_timestamp()`
+   复核空闲；任一副被占用则整笔拒绝（`ANTENNA_BUSY` 列出全部阻塞天线），
+   事务回滚，**一副都不占**；
+5. 同一条原子语句里物化一次 `clock_timestamp()`、递增两副天线各自的
+   `last_control_generation`、写入组合申请记录与两份成员租约——四处的
+   取得/到期时刻完全相同，随后一次提交。
+
 ---
 
 ## 6. 本地运行测试（不使用 verify 容器）
@@ -471,6 +579,14 @@ pytest
   前后快照天线计数与租约数据完全不变，拒绝后首次成功紧接上一已提交租约（2→3）；
   进度上报与续期不改代次；以及用真实 PostgreSQL 临时表验证迁移回填按
   `acquired_at, id` 排序的窗口函数语义（同时刻以记录编号决胜）。
+- `tests/test_lease_bundles.py` — 双站协同上行：双空闲时原子成功且两份租约
+  取得/到期时刻逐字节一致（含组合申请记录）、成员令牌经原查询接口仍是普通
+  租约；单副占用时零新增租约且占用反馈列出阻塞天线与到期时间（双副占用时
+  列出两副）；同键重放（含天线对反序）只保留两份租约记录且逐字节一致、
+  改参稳定 `IDEMPOTENCY_CONFLICT`；未知天线 404、编号重复/数量不对/租期
+  越界 422 且零落库、边界值 5 与 120 接受；两组反序天线 8 路屏障并发不死锁、
+  至多一组成功；成员令牌可上报进度/续期/提前释放且释放一副不影响另一副；
+  到期边界后新组合申请接管且各天线代次各自递增。
 
 测试不使用任何固定响应或假接口：全部通过 HTTP 打向真实服务，并直连真实
 PostgreSQL 制造并发、播种到期数据和断言提交结果。

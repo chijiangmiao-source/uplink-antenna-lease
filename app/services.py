@@ -27,6 +27,12 @@ Concurrency design (all inside one READ COMMITTED transaction):
 Progress reporting, early release and renewal take the same antenna row lock
 as lease acquisition. Every timestamp originates from PostgreSQL; the host
 clock is never read.
+
+Dual-site bundles (``acquire_lease_bundle``) follow the same model but lock
+both antenna rows in ascending id order and sample ``clock_timestamp()``
+once, so the two member leases are granted atomically with identical
+timestamps and reversed-order concurrent requests serialise instead of
+deadlocking.
 """
 
 from __future__ import annotations
@@ -228,6 +234,273 @@ def acquire_lease(
         },
     ).mappings().one()
     return {**dict(row), "replay": False}
+
+
+def _bundle_canonical_params(
+    antenna_ids: list[str], controller: str, duration_seconds: int
+) -> str:
+    # The antenna pair is canonicalised in ascending order, so submitting the
+    # same pair in the opposite order is the SAME request (replayed), while
+    # any actual parameter change is a stable conflict.
+    ordered = sorted(antenna_ids)
+    return (
+        f"antenna_ids={ordered[0]},{ordered[1]}\n"
+        f"controller={controller}\n"
+        f"duration_seconds={duration_seconds}"
+    )
+
+
+def acquire_lease_bundle(
+    conn: Connection,
+    *,
+    antenna_ids: list[str],
+    controller: str,
+    duration_seconds: int,
+    idempotency_key: str,
+) -> dict[str, Any]:
+    """Atomically lease TWO antennas for dual-site coordinated uplink.
+
+    Same single-transaction READ COMMITTED model as single-antenna
+    acquisition, extended to a pair:
+
+    1. ``pg_advisory_xact_lock(hashtext(:key))`` serialises transactions
+       sharing the bundle idempotency key (bundle keys live in
+       ``lease_bundles`` itself, apart from the acquisition/renewal tables).
+    2. Replay or stable conflict against the stored bundle record.
+    3. Both antenna rows are locked ``FOR UPDATE`` **in ascending id order**.
+       Every contender — bundle or single — therefore takes multi-antenna
+       locks in the same global order, so two reversed-order bundle requests
+       serialise instead of deadlocking.
+    4. Both antennas must be free (``released_at IS NULL AND expires_at >
+       clock_timestamp()``); if either is held the WHOLE request is rejected
+       with ``ANTENNA_BUSY`` listing every blocking antenna, and nothing is
+       written — a dual-site pass never occupies just one antenna.
+    5. One atomic statement samples ``clock_timestamp()`` a single time,
+       bumps each antenna's generation, and inserts the bundle record plus
+       both leases stamped with that one instant: identical ``acquired_at``
+       and ``expires_at`` on both member leases.
+    """
+    # Defence in depth alongside the Pydantic boundary checks; rejections
+    # happen before any write statement is issued.
+    if not (
+        isinstance(duration_seconds, int)
+        and MIN_LEASE_SECONDS <= duration_seconds <= MAX_LEASE_SECONDS
+    ):
+        raise APIError(
+            422,
+            "LEASE_DURATION_OUT_OF_RANGE",
+            f"租期必须为 {MIN_LEASE_SECONDS} 至 {MAX_LEASE_SECONDS} 秒之间的整数。",
+            {
+                "duration_seconds": duration_seconds,
+                "min": MIN_LEASE_SECONDS,
+                "max": MAX_LEASE_SECONDS,
+            },
+        )
+    ids = list(antenna_ids)
+    if len(ids) != 2 or len(set(ids)) != 2:
+        raise APIError(
+            422,
+            "VALIDATION_ERROR",
+            "双站协同上行需要两个不同的天线编号。",
+            {"antenna_ids": ids},
+        )
+    ordered = sorted(ids)
+    fingerprint = _bundle_canonical_params(ids, controller, duration_seconds)
+
+    # 1. Serialise transactions sharing one bundle idempotency key.
+    conn.execute(
+        text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
+        {"key": idempotency_key},
+    )
+
+    # 2. Replay the original token pair, or refuse a key reuse with
+    #    different parameters. Neither path writes.
+    existing = conn.execute(
+        text(
+            """
+            SELECT id AS bundle_id, controller, acquired_at, expires_at,
+                   request_params
+            FROM lease_bundles
+            WHERE idempotency_key = :key
+            """
+        ),
+        {"key": idempotency_key},
+    ).mappings().first()
+    if existing is not None:
+        if existing.request_params != fingerprint:
+            raise APIError(
+                409,
+                "IDEMPOTENCY_CONFLICT",
+                "同一幂等键曾用于不同的组合申请参数，拒绝执行。",
+                {
+                    "idempotency_key": idempotency_key,
+                    "original_params": existing.request_params,
+                    "request_params": fingerprint,
+                },
+            )
+        members = conn.execute(
+            text(
+                """
+                SELECT antenna_id, token AS lease_token, control_generation
+                FROM leases
+                WHERE bundle_id = :bundle_id
+                ORDER BY antenna_id
+                """
+            ),
+            {"bundle_id": existing.bundle_id},
+        ).mappings().all()
+        return {
+            "controller": existing.controller,
+            "acquired_at": existing.acquired_at,
+            "expires_at": existing.expires_at,
+            "leases": [dict(member) for member in members],
+            "replay": True,
+        }
+
+    # 3. Lock both antenna rows in ascending id order (also proves both are
+    #    provisioned). A reversed-order concurrent bundle request takes the
+    #    same locks in the same order, so the pair serialises on the first
+    #    antenna instead of deadlocking; single-antenna operations join the
+    #    same per-row queues.
+    for antenna_id in ordered:
+        antenna = conn.execute(
+            text("SELECT id FROM antennas WHERE id = :antenna_id FOR UPDATE"),
+            {"antenna_id": antenna_id},
+        ).first()
+        if antenna is None:
+            raise APIError(
+                404,
+                "ANTENNA_NOT_FOUND",
+                f"未知天线：{antenna_id}",
+                {"antenna_id": antenna_id},
+            )
+
+    # 4. Both antennas must be free; the expiry boundary belongs to the new
+    #    request exactly as in single acquisition. Every blocking antenna is
+    #    reported, and the whole request rolls back without a single write.
+    blockers = conn.execute(
+        text(
+            """
+            SELECT antenna_id, token, expires_at
+            FROM leases
+            WHERE antenna_id IN (:antenna_a, :antenna_b)
+              AND released_at IS NULL
+              AND expires_at > clock_timestamp()
+            ORDER BY antenna_id, acquired_at DESC, id DESC
+            """
+        ),
+        {"antenna_a": ordered[0], "antenna_b": ordered[1]},
+    ).mappings().all()
+    if blockers:
+        raise APIError(
+            409,
+            "ANTENNA_BUSY",
+            "双站协同上行被拒绝：天线 "
+            + "、".join(blocker.antenna_id for blocker in blockers)
+            + " 正被未到期租约占用，未占用任何天线。",
+            {
+                "blocked_antennas": [
+                    {
+                        "antenna_id": blocker.antenna_id,
+                        "held_by_lease": blocker.token,
+                        "expires_at": blocker.expires_at.isoformat(),
+                    }
+                    for blocker in blockers
+                ]
+            },
+        )
+
+    # 5. One atomic statement: ``now`` is materialised so clock_timestamp()
+    #    is sampled exactly once; both antenna generations are bumped (each
+    #    antenna keeps its own independent sequence); the bundle record and
+    #    both leases are inserted stamped with that single instant. The
+    #    antenna rows are already locked FOR UPDATE, so the increments and
+    #    the inserts are serialised against every contender; any rejection
+    #    above returns before this point and rolls back, never consuming a
+    #    generation on either antenna. Tokens come from PostgreSQL's CSPRNG,
+    #    base64url-encoded without padding, exactly like single acquisition.
+    rows = conn.execute(
+        text(
+            """
+            WITH now AS MATERIALIZED (
+                SELECT clock_timestamp() AS ts
+            ), bumped AS (
+                UPDATE antennas
+                SET last_control_generation =
+                        COALESCE(last_control_generation, 0) + 1
+                WHERE id IN (:antenna_a, :antenna_b)
+                RETURNING id AS antenna_id,
+                          last_control_generation AS control_generation
+            ), bundle AS (
+                INSERT INTO lease_bundles
+                    (idempotency_key, controller, duration_seconds,
+                     acquired_at, expires_at, request_params)
+                SELECT
+                    :key,
+                    :controller,
+                    :duration,
+                    now.ts,
+                    now.ts + make_interval(secs => :duration),
+                    :params
+                FROM now
+                RETURNING id AS bundle_id, acquired_at, expires_at
+            ), new_leases AS (
+                INSERT INTO leases
+                    (antenna_id, controller, token,
+                     acquired_at, expires_at, control_generation, bundle_id)
+                SELECT
+                    bumped.antenna_id,
+                    :controller,
+                    rtrim(
+                        replace(
+                            replace(encode(gen_random_bytes(32), 'base64'), '+', '-'),
+                            '/', '_'
+                        ),
+                        '='
+                    ),
+                    bundle.acquired_at,
+                    bundle.expires_at,
+                    bumped.control_generation,
+                    bundle.bundle_id
+                FROM bumped
+                CROSS JOIN bundle
+                RETURNING antenna_id, token AS lease_token,
+                          control_generation
+            )
+            SELECT
+                bundle.acquired_at AS acquired_at,
+                bundle.expires_at AS expires_at,
+                new_leases.antenna_id AS antenna_id,
+                new_leases.lease_token AS lease_token,
+                new_leases.control_generation AS control_generation
+            FROM new_leases
+            CROSS JOIN bundle
+            ORDER BY new_leases.antenna_id
+            """
+        ),
+        {
+            "antenna_a": ordered[0],
+            "antenna_b": ordered[1],
+            "controller": controller,
+            "duration": duration_seconds,
+            "key": idempotency_key,
+            "params": fingerprint,
+        },
+    ).mappings().all()
+    return {
+        "controller": controller,
+        "acquired_at": rows[0].acquired_at,
+        "expires_at": rows[0].expires_at,
+        "leases": [
+            {
+                "antenna_id": row.antenna_id,
+                "lease_token": row.lease_token,
+                "control_generation": row.control_generation,
+            }
+            for row in rows
+        ],
+        "replay": False,
+    }
 
 
 def _renewal_canonical_params(lease_id: int, extra_seconds: int) -> str:
