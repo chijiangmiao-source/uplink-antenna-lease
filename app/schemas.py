@@ -68,3 +68,32 @@ class AcquireResponse(_LeaseBase):
 
 class LeaseStatusResponse(_LeaseBase):
     active: bool
+    # Progress tracking. Both stay NULL for leases that have never reported
+    # (including every lease that existed before the progress feature); they
+    # are never backfilled.
+    last_command_sequence: int | None = None
+    last_progress_at: datetime | None = None
+
+    @field_serializer("last_progress_at", when_used="always")
+    def _serialize_progress_at(self, value: datetime | None) -> str | None:
+        return value.isoformat() if value is not None else None
+
+
+class ProgressRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    # JSON integer only (a textual "3" is rejected); ge=0 enforces the
+    # non-negative bound at the HTTP boundary as well as in the service.
+    # The upper bound matches the BIGINT column so an oversized integer gets
+    # a stable 422 instead of a database error.
+    sequence: StrictInt = Field(..., ge=0, le=2**63 - 1)
+
+
+class ProgressResponse(BaseModel):
+    lease_token: str
+    last_command_sequence: int
+    last_progress_at: datetime
+
+    @field_serializer("last_progress_at", when_used="always")
+    def _serialize_progress_at(self, value: datetime) -> str:
+        return value.isoformat()
