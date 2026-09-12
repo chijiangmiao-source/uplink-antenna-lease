@@ -37,33 +37,34 @@ class AcquireRequest(BaseModel):
         return value
 
 
-class _TimestampedLeaseModel(BaseModel):
-    """Shared serialisation for lease timestamps.
+class _LeaseBase(BaseModel):
+    """Shared lease fields and timestamp serialisation.
 
     Pydantic renders a UTC datetime as ``...Z`` while FastAPI's plain-dict
     path (``jsonable_encoder``) renders it as ``...+00:00``; routing every
     lease response through one explicit serializer keeps the same
     ``expires_at`` byte-identical across acquisition and lookup.
+
+    The serializer references ``acquired_at``/``expires_at``, so those fields
+    MUST be declared on this same class: Pydantic v2 rejects a field
+    serializer whose target fields are only defined in a subclass (it raises
+    at import time, which would prevent the app from starting).
     """
+
+    antenna_id: str
+    controller: str
+    lease_token: str
+    acquired_at: datetime
+    expires_at: datetime
 
     @field_serializer("acquired_at", "expires_at", when_used="always")
     def _serialize_iso8601(self, value: datetime) -> str:
         return value.isoformat()
 
 
-class AcquireResponse(_TimestampedLeaseModel):
-    antenna_id: str
-    controller: str
-    lease_token: str
-    acquired_at: datetime
-    expires_at: datetime
+class AcquireResponse(_LeaseBase):
     replay: bool = False
 
 
-class LeaseStatusResponse(_TimestampedLeaseModel):
-    antenna_id: str
-    controller: str
-    lease_token: str
-    acquired_at: datetime
-    expires_at: datetime
+class LeaseStatusResponse(_LeaseBase):
     active: bool
