@@ -61,6 +61,12 @@ class _LeaseBase(BaseModel):
     lease_token: str
     acquired_at: datetime
     expires_at: datetime
+    # Per-antenna monotonically increasing control generation. A successful
+    # hand-over always returns a strictly larger value than the antenna's
+    # previous committed lease; a same-key replay returns the lease's fixed
+    # value. Devices use it to reject commands from a controller whose
+    # control epoch is stale after a network partition.
+    control_generation: int
 
     @field_serializer("acquired_at", "expires_at", when_used="always")
     def _serialize_iso8601(self, value: datetime) -> str:

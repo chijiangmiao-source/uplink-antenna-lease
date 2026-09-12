@@ -32,6 +32,7 @@ def test_both_response_models_serialise_timestamps_identically():
         "lease_token": "x" * 43,
         "acquired_at": instant,
         "expires_at": instant,
+        "control_generation": 7,
     }
 
     acquired = AcquireResponse(**common, replay=False).model_dump(mode="json")
@@ -42,6 +43,9 @@ def test_both_response_models_serialise_timestamps_identically():
     assert status["expires_at"] == expected
     assert acquired["expires_at"] == status["expires_at"]
     assert acquired["acquired_at"] == status["acquired_at"]
+    # The fixed generation rides along identically on both responses.
+    assert acquired["control_generation"] == 7
+    assert status["control_generation"] == 7
     # Explicit offset, never the bare "Z" shorthand.
     assert not acquired["expires_at"].endswith("Z")
     assert not status["expires_at"].endswith("Z")

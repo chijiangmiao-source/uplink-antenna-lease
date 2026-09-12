@@ -68,6 +68,13 @@ def reset_lease_tables(db_engine: Engine):
                 "lease_renewals, leases RESTART IDENTITY CASCADE"
             )
         )
+        # The antenna generation high-water marks live in the preserved
+        # antennas catalog, so truncating leases would otherwise leak
+        # generations between tests. Reset every antenna to its never-leased
+        # state so the first grant of each test starts at generation 1.
+        conn.execute(
+            text("UPDATE antennas SET last_control_generation = NULL")
+        )
     yield
 
 
@@ -150,20 +157,35 @@ def insert_expired_lease(
     controller: str = "expired-ctrl",
     token: str | None = None,
 ) -> dict[str, Any]:
-    """Insert a lease that expired ``age_seconds`` ago, directly via SQL."""
+    """Insert a lease that expired ``age_seconds`` ago, directly via SQL.
+
+    The antenna's last_control_generation is bumped in the same statement so
+    the seeded row carries the generation a real acquisition at that point in
+    history would have got; a later successful acquisition continues exactly
+    one above it.
+    """
     token = token or f"expired-{uuid.uuid4()}"
     with db_engine.begin() as conn:
         row = conn.execute(
             text(
                 """
+                WITH bumped AS (
+                    UPDATE antennas
+                    SET last_control_generation =
+                            COALESCE(last_control_generation, 0) + 1
+                    WHERE id = :antenna_id
+                    RETURNING last_control_generation AS control_generation
+                )
                 INSERT INTO leases (antenna_id, controller, token,
-                                    acquired_at, expires_at)
-                VALUES (
+                                    acquired_at, expires_at,
+                                    control_generation)
+                SELECT
                     :antenna_id, :controller, :token,
                     clock_timestamp() - make_interval(secs => :age + :ttl),
-                    clock_timestamp() - make_interval(secs => :age)
-                )
-                RETURNING token, acquired_at, expires_at
+                    clock_timestamp() - make_interval(secs => :age),
+                    control_generation
+                FROM bumped
+                RETURNING token, acquired_at, expires_at, control_generation
                 """
             ),
             {
