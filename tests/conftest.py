@@ -94,17 +94,25 @@ def acquire(
     )
 
 
+def release(client: httpx.Client, lease_token: str) -> httpx.Response:
+    return client.post(f"/leases/{lease_token}/release")
+
+
 def count_rows(db_engine: Engine, sql: str, **params: Any) -> int:
     with db_engine.connect() as conn:
         return int(conn.execute(text(sql), params).scalar_one())
 
 
 def active_lease_count(db_engine: Engine, antenna_id: str) -> int:
+    # Active == still held (never released) AND not yet expired, both judged
+    # against the database clock — the same predicate the service uses.
     return count_rows(
         db_engine,
         """
         SELECT count(*) FROM leases
-        WHERE antenna_id = :antenna_id AND expires_at > clock_timestamp()
+        WHERE antenna_id = :antenna_id
+          AND released_at IS NULL
+          AND expires_at > clock_timestamp()
         """,
         antenna_id=antenna_id,
     )

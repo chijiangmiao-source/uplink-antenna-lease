@@ -73,9 +73,16 @@ class LeaseStatusResponse(_LeaseBase):
     # are never backfilled.
     last_command_sequence: int | None = None
     last_progress_at: datetime | None = None
+    # NULL while the holder has not released early.  This is independent of
+    # the progress high-water mark above.
+    released_at: datetime | None = None
 
     @field_serializer("last_progress_at", when_used="always")
     def _serialize_progress_at(self, value: datetime | None) -> str | None:
+        return value.isoformat() if value is not None else None
+
+    @field_serializer("released_at", when_used="always")
+    def _serialize_released_at(self, value: datetime | None) -> str | None:
         return value.isoformat() if value is not None else None
 
 

@@ -115,6 +115,9 @@ alembic downgrade base    # 回滚全部迁移
   CHECK：序号非负、两字段同生共灭（`(seq IS NULL) = (time IS NULL)`）。
   **只加列不补数据**——迁移前的历史租约与获取接口新建的租约在首次上报前两个字段
   均为 `NULL`。
+- `alembic/versions/0002_lease_release.py`：在进度迁移之后增加
+  `released_at TIMESTAMPTZ NULL`。该值只由数据库时钟在提前释放时写入；
+  `NULL` 表示仍未主动让权。
 
 ---
 
@@ -261,10 +264,23 @@ curl -sS -X POST http://localhost:8000/leases/$LEASE_TOKEN/progress \
   -d '{"sequence": 3}'
 ```
 
-### 4.4 其他接口
+### 4.4 提前释放 `POST /leases/{lease_token}/release`
+
+过站提前结束或控制程序主动让权时，持有方可凭租约令牌立即释放天线，
+无需请求体。成功响应与状态查询同构，`active` 为 `false`，并返回由数据库
+时钟写入的 `released_at`。重复释放会原样重放第一次结果，不改写时间；
+未知令牌返回 `LEASE_NOT_FOUND`，从未释放且已经自然到期的租约返回
+`LEASE_EXPIRED`。释放和获取使用同一副天线的行锁，因此并发交接不会产生
+两个有效持有方。
+
+```bash
+curl -sS -X POST http://localhost:8000/leases/$LEASE_TOKEN/release
+```
+
+### 4.5 其他接口
 
 - `GET /leases/{lease_token}` — 查询租约与 `active` 状态（以数据库时间实时计算），
-  含上述两个可空进度字段；
+  含上述两个可空进度字段和可空的 `released_at`；
 - `GET /antennas` — 预置天线目录；
 - `GET /health` — 存活探针，返回数据库时钟 `database_time`；
 - 交互式文档：`GET /docs`（Swagger UI）。
@@ -280,8 +296,8 @@ curl -sS -X POST http://localhost:8000/leases/$LEASE_TOKEN/progress \
 2. 查 `idempotency_keys`：参数一致 → 重放原令牌/原到期时间；不一致 → 稳定冲突；
 3. `SELECT ... FROM antennas WHERE id=:id FOR UPDATE`
    —— 串行化同天线的所有争抢者，同时完成“天线必须存在”的校验（未知天线在此之前无任何写入）；
-4. 以 `expires_at > clock_timestamp()` 判定活跃租约：未到期 → `ANTENNA_BUSY`；
-   `expires_at` 已到达（相等或已过去）→ 边界归新请求；
+4. 以 `released_at IS NULL AND expires_at > clock_timestamp()` 判定活跃租约：
+   未到期且未释放 → `ANTENNA_BUSY`；已释放或 `expires_at` 已到达 → 归新请求；
 5. 插入新租约与幂等记录并提交（同事务原子完成）。
 
 进度上报（`POST /leases/{token}/progress`）在同样的单事务模型内：
@@ -289,13 +305,18 @@ curl -sS -X POST http://localhost:8000/leases/$LEASE_TOKEN/progress \
 1. 按令牌找到租约（未知令牌在任何写操作之前返回 `LEASE_NOT_FOUND`）；
 2. `SELECT id FROM antennas WHERE id = :antenna_id FOR UPDATE`
    —— 锁定租约所属天线，并发上报（及该天线的获取事务）在此串行化；
-3. 锁后重新读取租约的最新高水位，并以 `expires_at > clock_timestamp()` 复核
-   仍未到期（否则 `LEASE_EXPIRED`，不写库）；
+3. 锁后重新读取租约的最新高水位，并复核租约仍未到期且未提前释放
+   （否则 `LEASE_EXPIRED`，不写库）；
 4. 相同序号 → 重放原记录时间；更小序号 → `PROGRESS_REGRESSION`；
    更大序号才执行 `UPDATE ... SET last_command_sequence=:seq,
    last_progress_at=clock_timestamp()`。
 
 所有“当前时间”和到期时间都在 SQL 内由 PostgreSQL 产生，应用层没有任何时间判断。
+
+提前释放同样先锁定租约所属天线，再在锁内重读租约。第一次释放写入
+`released_at = clock_timestamp()`；重复释放重放原时间；自然到期且从未释放的
+记录保持不变。获取租约的活跃谓词同时要求 `released_at IS NULL`，所以释放提交后
+下一位控制者可以立即取得天线。
 
 ---
 
@@ -331,6 +352,8 @@ pytest
   稳定的原记录时间、更小序号 `PROGRESS_REGRESSION` 不写库、未知/已到期令牌
   分别 `LEASE_NOT_FOUND` / `LEASE_EXPIRED` 且数据不变、非法请求体 422、
   20 路屏障并发上报最终保留最大序号、到期交接后旧令牌被拒新持有方可上报。
+- `tests/test_release.py` — 活跃租约提前释放后立即交接、重复释放稳定重放、
+  自然到期拒绝写入，以及释放与争抢并发时不产生双重控制权。
 
 测试不使用任何固定响应或假接口：全部通过 HTTP 打向真实服务，并直连真实
 PostgreSQL 制造并发、播种到期数据和断言提交结果。

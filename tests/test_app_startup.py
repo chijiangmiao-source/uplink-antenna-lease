@@ -15,9 +15,12 @@ from app.schemas import AcquireResponse, LeaseStatusResponse
 
 
 def test_app_module_imports_and_routes_are_registered():
-    paths = {getattr(r, "path", None) for r in app.routes}
+    # Newer FastAPI versions materialise included routers lazily, so scan the
+    # OpenAPI schema (public API) instead of app.routes internals.
+    paths = set(app.openapi()["paths"])
     assert "/leases" in paths
     assert "/leases/{lease_token}" in paths
+    assert "/leases/{lease_token}/release" in paths
     assert "/health" in paths
 
 

@@ -14,7 +14,12 @@ from app.schemas import (
     ProgressRequest,
     ProgressResponse,
 )
-from app.services import acquire_lease, get_lease_by_token, report_progress
+from app.services import (
+    acquire_lease,
+    get_lease_by_token,
+    release_lease,
+    report_progress,
+)
 
 router = APIRouter(tags=["leases"])
 
@@ -24,6 +29,13 @@ def get_session():
     # boundaries explicitly.
     with Session(engine, future=True) as session:
         yield session
+
+
+def _to_status_response(result: dict) -> dict:
+    # Normalise internal database names to the public response model.
+    result.pop("lease_id", None)
+    result["lease_token"] = result.pop("token")
+    return result
 
 
 @router.post(
@@ -64,11 +76,7 @@ def lease_status(lease_token: str, session: Session = Depends(get_session)):
             {"lease_token": lease_token},
         )
     session.commit()
-    # Normalise to the response model field names (drop the internal id,
-    # expose the token as ``lease_token``).
-    result.pop("lease_id", None)
-    result["lease_token"] = result.pop("token")
-    return result
+    return _to_status_response(result)
 
 
 @router.post(
@@ -91,3 +99,19 @@ def report_lease_progress(
         raise
     session.commit()
     return result
+
+
+@router.post(
+    "/leases/{lease_token}/release",
+    response_model=LeaseStatusResponse,
+    status_code=200,
+    summary="持有方提前释放租约（过站提前结束/主动让权）",
+)
+def release(lease_token: str, session: Session = Depends(get_session)):
+    try:
+        result = release_lease(session.connection(), lease_token)
+    except APIError:
+        session.rollback()
+        raise
+    session.commit()
+    return _to_status_response(result)

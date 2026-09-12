@@ -30,4 +30,4 @@ COPY alembic ./alembic
 COPY alembic.ini ./alembic.ini
 COPY tests ./tests
 COPY pytest.ini ./pytest.ini
-CMD ["pytest"]
+CMD ["python", "-m", "pytest"]

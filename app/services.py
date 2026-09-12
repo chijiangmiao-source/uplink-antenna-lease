@@ -10,13 +10,17 @@ Concurrency design (all inside one READ COMMITTED transaction):
 3. ``SELECT ... FROM antennas WHERE id = :antenna_id FOR UPDATE``
    Serialises every contender for the same antenna. Unknown antenna raises
    ``ANTENNA_NOT_FOUND`` before any row is written.
-4. Look up an active lease with ``expires_at > clock_timestamp()``. A lease
+4. Look up an active lease with
+   ``released_at IS NULL AND expires_at > clock_timestamp()``. A lease
    whose ``expires_at`` has been reached (``expires_at <= clock_timestamp()``)
-   is gone: the boundary belongs to the new request.
+   is gone: the boundary belongs to the new request. A lease released early
+   is also immediately available for handover.
 5. Insert the new lease (``expires_at = clock_timestamp() + make_interval``)
    and its idempotency record, then commit atomically.
 
-Every timestamp originates from PostgreSQL; the host clock is never read.
+Progress reporting and early release take the same antenna row lock as lease
+acquisition. Every timestamp originates from PostgreSQL; the host clock is
+never read.
 """
 
 from __future__ import annotations
@@ -132,6 +136,7 @@ def acquire_lease(
             SELECT token, expires_at
             FROM leases
             WHERE antenna_id = :antenna_id
+              AND released_at IS NULL
               AND expires_at > clock_timestamp()
             ORDER BY acquired_at DESC, id DESC
             LIMIT 1
@@ -200,9 +205,10 @@ def get_lease_by_token(conn: Connection, token: str) -> dict[str, Any] | None:
         text(
             """
             SELECT id AS lease_id, antenna_id, controller,
-                   token, acquired_at, expires_at,
+                   token, acquired_at, expires_at, released_at,
                    last_command_sequence, last_progress_at,
-                   (expires_at > clock_timestamp()) AS active
+                   (released_at IS NULL AND expires_at > clock_timestamp())
+                       AS active
             FROM leases
             WHERE token = :token
             """
@@ -269,7 +275,7 @@ def report_progress(conn: Connection, token: str, sequence: int) -> dict[str, An
     lease = conn.execute(
         text(
             """
-            SELECT id AS lease_id, antenna_id, expires_at,
+            SELECT id AS lease_id, antenna_id, expires_at, released_at,
                    last_command_sequence, last_progress_at
             FROM leases
             WHERE id = :lease_id
@@ -281,11 +287,11 @@ def report_progress(conn: Connection, token: str, sequence: int) -> dict[str, An
     # 2. Expiry is evaluated against the database clock: a report never
     #    extends the lease and never lands on an expired one.
     now = conn.execute(text("SELECT clock_timestamp()")).scalar_one()
-    if lease.expires_at <= now:
+    if lease.released_at is not None or lease.expires_at <= now:
         raise APIError(
             409,
             "LEASE_EXPIRED",
-            "租约已到期，不能再上报指令进度。",
+            "租约已到期或已提前释放，不能再上报指令进度。",
             {
                 "lease_token": token,
                 "antenna_id": lease.antenna_id,
@@ -335,3 +341,70 @@ def report_progress(conn: Connection, token: str, sequence: int) -> dict[str, An
         "last_command_sequence": row.last_command_sequence,
         "last_progress_at": row.last_progress_at,
     }
+
+
+def release_lease(conn: Connection, token: str) -> dict[str, Any]:
+    """Release an active lease early under the antenna's row lock."""
+    found = conn.execute(
+        text("SELECT id, antenna_id FROM leases WHERE token = :token"),
+        {"token": token},
+    ).mappings().first()
+    if found is None:
+        raise APIError(
+            404,
+            "LEASE_NOT_FOUND",
+            "未知租约令牌。",
+            {"lease_token": token},
+        )
+
+    conn.execute(
+        text("SELECT id FROM antennas WHERE id = :antenna_id FOR UPDATE"),
+        {"antenna_id": found.antenna_id},
+    ).one()
+    lease = conn.execute(
+        text(
+            """
+            SELECT id AS lease_id, antenna_id, controller, token,
+                   acquired_at, expires_at, released_at,
+                   last_command_sequence, last_progress_at,
+                   (expires_at > clock_timestamp()) AS unexpired
+            FROM leases
+            WHERE id = :lease_id
+            """
+        ),
+        {"lease_id": found.id},
+    ).mappings().one()
+
+    if lease.released_at is not None:
+        return _release_result(lease, lease.released_at)
+    if not lease.unexpired:
+        raise APIError(
+            409,
+            "LEASE_EXPIRED",
+            "租约已自然到期，无需释放。",
+            {
+                "lease_token": token,
+                "expires_at": lease.expires_at.isoformat(),
+            },
+        )
+
+    released_at = conn.execute(
+        text(
+            """
+            UPDATE leases
+            SET released_at = clock_timestamp()
+            WHERE id = :lease_id
+            RETURNING released_at
+            """
+        ),
+        {"lease_id": lease.lease_id},
+    ).scalar_one()
+    return _release_result(lease, released_at)
+
+
+def _release_result(row: Any, released_at: Any) -> dict[str, Any]:
+    result = dict(row)
+    result.pop("unexpired", None)
+    result["released_at"] = released_at
+    result["active"] = False
+    return result
