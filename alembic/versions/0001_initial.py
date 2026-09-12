@@ -47,7 +47,15 @@ def upgrade() -> None:
 
     op.create_table(
         "leases",
-        sa.Column("id", sa.BigInteger, primary_key=True),
+        # autoincrement renders as BIGSERIAL / IDENTITY on PostgreSQL; a plain
+        # BIGINT PRIMARY KEY has no sequence and inserts that omit id would
+        # violate NOT NULL.
+        sa.Column(
+            "id",
+            sa.BigInteger(),
+            primary_key=True,
+            autoincrement=True,
+        ),
         sa.Column(
             "antenna_id",
             sa.String(length=64),
