@@ -13,7 +13,12 @@ from pydantic import (
     field_validator,
 )
 
-from app.config import MAX_LEASE_SECONDS, MIN_LEASE_SECONDS
+from app.config import (
+    MAX_LEASE_SECONDS,
+    MAX_RENEW_SECONDS,
+    MIN_LEASE_SECONDS,
+    MIN_RENEW_SECONDS,
+)
 
 
 class AcquireRequest(BaseModel):
@@ -103,4 +108,44 @@ class ProgressResponse(BaseModel):
 
     @field_serializer("last_progress_at", when_used="always")
     def _serialize_progress_at(self, value: datetime) -> str:
+        return value.isoformat()
+
+
+class RenewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    # Extra holding time added ON TOP of the current expiry. JSON integer
+    # only; the closed [5, 120] bound matches a single acquisition.
+    extra_seconds: StrictInt = Field(
+        ...,
+        ge=MIN_RENEW_SECONDS,
+        le=MAX_RENEW_SECONDS,
+        description=(
+            f"追加秒数（JSON 整数），闭区间 [{MIN_RENEW_SECONDS}, "
+            f"{MAX_RENEW_SECONDS}] 秒，从当前到期时间继续累加。"
+        ),
+    )
+    idempotency_key: str = Field(..., min_length=1, max_length=128)
+
+    @field_validator("idempotency_key")
+    @classmethod
+    def _reject_blank(cls, value: str) -> str:
+        if not value or not value.strip():
+            raise ValueError("不能为空或纯空白。")
+        return value
+
+
+class RenewResponse(BaseModel):
+    lease_token: str
+    previous_expires_at: datetime
+    new_expires_at: datetime
+    # False on the first accepted renewal; True when the same key + same
+    # parameters replay a previously accepted renewal. Apart from this flag
+    # the business fields are byte-identical to the first response.
+    replay: bool = False
+
+    @field_serializer(
+        "previous_expires_at", "new_expires_at", when_used="always"
+    )
+    def _serialize_iso8601(self, value: datetime) -> str:
         return value.isoformat()

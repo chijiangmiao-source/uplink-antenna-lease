@@ -25,3 +25,9 @@ DATABASE_URL: str = _database_url()
 # Inclusive lease duration bounds in seconds.
 MIN_LEASE_SECONDS: int = 5
 MAX_LEASE_SECONDS: int = 120
+
+# Inclusive bounds for a single renewal extension, in seconds. A holder may
+# stack several renewals (each with its own idempotency key), but each
+# individual extension falls in this range.
+MIN_RENEW_SECONDS: int = 5
+MAX_RENEW_SECONDS: int = 120
