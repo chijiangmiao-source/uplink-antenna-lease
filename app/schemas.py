@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 
 from app.config import MAX_LEASE_SECONDS, MIN_LEASE_SECONDS
 
@@ -14,11 +14,11 @@ class AcquireRequest(BaseModel):
 
     antenna_id: str = Field(..., min_length=1, max_length=64)
     controller: str = Field(..., min_length=1, max_length=128)
-    duration_seconds: int = Field(
+    duration_seconds: StrictInt = Field(
         ...,
         ge=MIN_LEASE_SECONDS,
         le=MAX_LEASE_SECONDS,
-        description=f"租约时长，闭区间 [{MIN_LEASE_SECONDS}, {MAX_LEASE_SECONDS}] 秒。",
+        description=f"租约时长（必须是 JSON 整数，不接受文本数字），闭区间 [{MIN_LEASE_SECONDS}, {MAX_LEASE_SECONDS}] 秒。",
     )
     idempotency_key: str = Field(..., min_length=1, max_length=128)
 

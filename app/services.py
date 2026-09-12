@@ -152,7 +152,10 @@ def acquire_lease(
         )
 
     # 5. Create lease + idempotency record atomically. Token comes from
-    #    PostgreSQL's CSPRNG so it is unpredictable on the wire.
+    #    PostgreSQL's CSPRNG so it is unpredictable on the wire. Standard
+    #    base64 contains '/', '+' and '=' which are unsafe in a single URL
+    #    path segment, so emit the base64url alphabet with padding stripped
+    #    (43 chars for 32 random bytes).
     row = conn.execute(
         text(
             """
@@ -161,7 +164,13 @@ def acquire_lease(
                 VALUES (
                     :antenna_id,
                     :controller,
-                    encode(gen_random_bytes(32), 'base64'),
+                    rtrim(
+                        replace(
+                            replace(encode(gen_random_bytes(32), 'base64'), '+', '-'),
+                            '/', '_'
+                        ),
+                        '='
+                    ),
                     clock_timestamp(),
                     clock_timestamp() + make_interval(secs => :duration)
                 )

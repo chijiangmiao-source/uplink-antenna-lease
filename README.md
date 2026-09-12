@@ -128,14 +128,16 @@ alembic downgrade base    # 回滚全部迁移
 {
   "antenna_id": "ANT-01",
   "controller": "gs-beijing-A",
-  "lease_token": "k3J9...（32 随机字节的 base64，由 PostgreSQL CSPRNG 生成，不可预测）",
+  "lease_token": "k3J9...（32 随机字节的 base64url 无填充编码，43 个字符，仅含 A–Z a–z 0–9 - _，可直接放进 URL 路径段；PostgreSQL CSPRNG 生成，不可预测）",
   "acquired_at": "2026-09-12T04:00:00.123456+00:00",
   "expires_at": "2026-09-12T04:00:30.123456+00:00",
   "replay": false
 }
 ```
 
-- `lease_token` 不可预测：由数据库 `gen_random_bytes(32)` 生成；
+- `lease_token` 不可预测且 URL 安全：由数据库 `gen_random_bytes(32)` 生成后做
+  base64url 转换（`+→-`、`/→_`、去掉 `=` 填充，43 字符），可直接用于
+  `GET /leases/{lease_token}` 路径；
 - `expires_at = clock_timestamp() + duration_seconds`，完全由数据库计算；
 - 同键同参重试返回 `200` 且 `replay: true`，令牌与到期时间与首次完全一致。
 
@@ -225,8 +227,10 @@ pytest
 
 测试内容：
 
-- `tests/test_input_validation.py` — 未知天线、租期越界/非整数、缺字段/空白、
+- `tests/test_input_validation.py` — 未知天线、租期越界/非整数（含文本 `"30"`）、缺字段/空白、
   边界值（5 与 120）、拒绝路径零落库；
+- `tests/test_token_safety.py` — 令牌为 URL 安全的 base64url（无 `/ + =`）、
+  2000 次抽样数据库令牌生成器、刚获取的租约可经路径查询详情、文本租期拒绝零落库；
 - `tests/test_idempotency.py` — 原令牌/原到期重放、令牌不可预测、三类参数冲突稳定、
   过期后同键仍重放；
 - `tests/test_concurrency.py` — 12 路屏障并发争抢空闲天线仅 1 胜、
