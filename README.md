@@ -135,6 +135,10 @@ alembic downgrade base    # 回滚全部迁移
 }
 ```
 
+时间戳在所有接口（获取、重放、令牌查询）中使用**完全一致的 ISO-8601 带显式偏移量**
+表示（`+00:00`，不混用 `Z`），可逐字节比较；同一个 `expires_at` 在获取与查询响应中
+字符串相同。
+
 - `lease_token` 不可预测且 URL 安全：由数据库 `gen_random_bytes(32)` 生成后做
   base64url 转换（`+→-`、`/→_`、去掉 `=` 填充，43 字符），可直接用于
   `GET /leases/{lease_token}` 路径；
@@ -230,7 +234,8 @@ pytest
 - `tests/test_input_validation.py` — 未知天线、租期越界/非整数（含文本 `"30"`）、缺字段/空白、
   边界值（5 与 120）、拒绝路径零落库；
 - `tests/test_token_safety.py` — 令牌为 URL 安全的 base64url（无 `/ + =`）、
-  2000 次抽样数据库令牌生成器、刚获取的租约可经路径查询详情、文本租期拒绝零落库；
+  2000 次抽样数据库令牌生成器、刚获取的租约可经路径查询详情、获取/查询/重放三端
+  `expires_at`/`acquired_at` 逐字节同格式、文本租期拒绝零落库；
 - `tests/test_idempotency.py` — 原令牌/原到期重放、令牌不可预测、三类参数冲突稳定、
   过期后同键仍重放；
 - `tests/test_concurrency.py` — 12 路屏障并发争抢空闲天线仅 1 胜、

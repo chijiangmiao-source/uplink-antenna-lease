@@ -4,7 +4,14 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictInt,
+    field_serializer,
+    field_validator,
+)
 
 from app.config import MAX_LEASE_SECONDS, MIN_LEASE_SECONDS
 
@@ -30,10 +37,33 @@ class AcquireRequest(BaseModel):
         return value
 
 
-class AcquireResponse(BaseModel):
+class _TimestampedLeaseModel(BaseModel):
+    """Shared serialisation for lease timestamps.
+
+    Pydantic renders a UTC datetime as ``...Z`` while FastAPI's plain-dict
+    path (``jsonable_encoder``) renders it as ``...+00:00``; routing every
+    lease response through one explicit serializer keeps the same
+    ``expires_at`` byte-identical across acquisition and lookup.
+    """
+
+    @field_serializer("acquired_at", "expires_at", when_used="always")
+    def _serialize_iso8601(self, value: datetime) -> str:
+        return value.isoformat()
+
+
+class AcquireResponse(_TimestampedLeaseModel):
     antenna_id: str
     controller: str
     lease_token: str
     acquired_at: datetime
     expires_at: datetime
     replay: bool = False
+
+
+class LeaseStatusResponse(_TimestampedLeaseModel):
+    antenna_id: str
+    controller: str
+    lease_token: str
+    acquired_at: datetime
+    expires_at: datetime
+    active: bool

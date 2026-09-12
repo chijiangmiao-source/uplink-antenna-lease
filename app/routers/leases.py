@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 
 from app.db import engine
 from app.errors import APIError
-from app.schemas import AcquireRequest, AcquireResponse
+from app.schemas import AcquireRequest, AcquireResponse, LeaseStatusResponse
 from app.services import acquire_lease, get_lease_by_token
 
 router = APIRouter(tags=["leases"])
@@ -42,7 +42,11 @@ def acquire(payload: AcquireRequest, session: Session = Depends(get_session)):
     return result
 
 
-@router.get("/leases/{lease_token}", summary="按令牌查询租约状态")
+@router.get(
+    "/leases/{lease_token}",
+    response_model=LeaseStatusResponse,
+    summary="按令牌查询租约状态",
+)
 def lease_status(lease_token: str, session: Session = Depends(get_session)):
     result = get_lease_by_token(session.connection(), lease_token)
     if result is None:
@@ -54,11 +58,8 @@ def lease_status(lease_token: str, session: Session = Depends(get_session)):
             {"lease_token": lease_token},
         )
     session.commit()
-    return {
-        "antenna_id": result["antenna_id"],
-        "controller": result["controller"],
-        "lease_token": result["token"],
-        "acquired_at": result["acquired_at"],
-        "expires_at": result["expires_at"],
-        "active": result["active"],
-    }
+    # Normalise to the response model field names (drop the internal id,
+    # expose the token as ``lease_token``).
+    result.pop("lease_id", None)
+    result["lease_token"] = result.pop("token")
+    return result

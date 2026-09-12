@@ -73,6 +73,59 @@ def test_freshly_acquired_lease_is_retrievable_by_token(http_client):
     assert detail["acquired_at"] == body["acquired_at"]
 
 
+# ISO-8601 with an explicit UTC offset (e.g. 2026-09-12T04:00:30.123456+00:00).
+# A bare "Z" on one endpoint and "+00:00" on the other would fail this.
+ISO_OFFSET = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?[+-]\d{2}:\d{2}$"
+)
+
+
+def test_expires_at_format_is_identical_between_acquire_and_lookup(http_client):
+    acquired = acquire(http_client, antenna_id="ANT-03", duration_seconds=25)
+    assert acquired.status_code == 200
+
+    token = acquired.json()["lease_token"]
+    lookup = http_client.get(f"/leases/{token}")
+    assert lookup.status_code == 200
+
+    acquired_raw = acquired.json()
+    lookup_raw = lookup.json()
+
+    # Byte-identical timestamps across the two endpoints (same representation,
+    # not merely the same parsed instant).
+    for field in ("acquired_at", "expires_at"):
+        assert acquired_raw[field] == lookup_raw[field], (
+            field,
+            acquired_raw[field],
+            lookup_raw[field],
+        )
+        assert ISO_OFFSET.match(acquired_raw[field]), acquired_raw[field]
+        assert ISO_OFFSET.match(lookup_raw[field]), lookup_raw[field]
+        assert not acquired_raw[field].endswith("Z")
+        assert not lookup_raw[field].endswith("Z")
+
+
+def test_replay_and_acquire_share_identical_timestamp_format(http_client):
+    key = make_key()
+    payload = {
+        "antenna_id": "ANT-04",
+        "controller": "format-check",
+        "duration_seconds": 15,
+        "idempotency_key": key,
+    }
+    first = http_client.post("/leases", json=payload)
+    assert first.status_code == 200
+    replay = http_client.post("/leases", json=payload)
+    assert replay.status_code == 200
+    assert replay.json()["replay"] is True
+
+    first_raw = first.json()
+    replay_raw = replay.json()
+    for field in ("acquired_at", "expires_at"):
+        assert replay_raw[field] == first_raw[field]
+        assert ISO_OFFSET.match(first_raw[field]), first_raw[field]
+
+
 def test_retrieval_works_for_antennas_that_would_contain_slashes_under_base64(
     http_client, db_engine
 ):
