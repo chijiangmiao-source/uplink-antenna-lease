@@ -1,4 +1,9 @@
-fastapi>=0.115,<1.0
+# FastAPI 0.116+/Starlette 1.x defer router inclusion until application
+# startup, so lease routes are absent from ``app.routes`` at import time and
+# the acceptance suite fails before any HTTP check runs. The service is built
+# and verified against the 0.115 line (eager include_router); its Starlette
+# pin (>=0.40,<0.42) comes in transitively.
+fastapi>=0.115,<0.116
 uvicorn[standard]>=0.30,<1.0
 SQLAlchemy>=2.0,<2.1
 psycopg2-binary>=2.9,<3.0
